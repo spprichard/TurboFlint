@@ -14,10 +14,12 @@ let package = Package(
         .executable(name: "TurboFieldfareMac", targets: ["TurboFieldfareMac"]),
         .executable(name: "TurboFieldfareDecodeService", targets: ["TurboFieldfareDecodeService"]),
         .executable(name: "TurboFieldfareServer", targets: ["TurboFieldfareServer"]),
+        .executable(name: "turboflint", targets: ["TurboFlintCLI"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
         .package(url: "https://github.com/apple/swift-nio.git", exact: "2.101.3"),
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.5.0"),
         // Pinned by revision: tag 1.7.3 predates the `\left...\right`
         // duplication fix and typesets 433 of the 607-string coverage sweep
         // against this revision's 479.
@@ -57,6 +59,15 @@ let package = Package(
             dependencies: ["TurboFieldfare"],
             path: "Sources/TurboFieldfareCLI",
             exclude: ["Command"]
+        ),
+        .executableTarget(
+            name: "TurboFlintCLI",
+            dependencies: [
+                "TurboFieldfare",
+                "TurboFieldfareFormat",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Sources/TurboFlintCLI"
         ),
         .executableTarget(
             name: "TurboFieldfareCLI",

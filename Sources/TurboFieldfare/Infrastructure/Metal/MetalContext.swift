@@ -141,12 +141,14 @@ public final class MetalContext: @unchecked Sendable {
         "fused",
         "prefill",
         "vision",
+        "flint",
     ]
 
     /// Bundle locations for runtime shader modules.
     private static let shaderSubdirectories: [String: String] = [
         "attention": "Metal/Attention",
         "dequant_int4": "Metal/Quant",
+        "flint": "Metal/Flint",
         "dequant_int8": "Metal/Quant",
         "fused": "Metal/Fusions",
         "logit": "Metal/Sampling",
