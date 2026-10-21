@@ -18,7 +18,7 @@ struct TurboFlintCLI: AsyncParsableCommand {
     @Option(help: "User message, wrapped in Flint's chat template.")
     var chat: String?
 
-    @Option(help: "Comma-separated prompt token ids.")
+    @Option(name: .customLong("prompt-ids"), help: "Comma-separated prompt token ids.")
     var promptIDs: String?
 
     @Option(help: "Tokens to generate (greedy).")
@@ -35,6 +35,12 @@ struct TurboFlintCLI: AsyncParsableCommand {
 
     @Flag(help: "Print generated ids as JSON on the last line (for oracle comparison).")
     var json = false
+
+    @Option(help: "Write per-layer residual stream of the last prompt token to this JSON file (debug).")
+    var dumpHidden: String?
+
+    @Flag(help: "Time individual kernels and exit.")
+    var profileKernels = false
 
     func run() async throws {
         let checkpoint = try FlintOllamaCheckpoint(manifestURL: URL(fileURLWithPath: manifest))
@@ -61,13 +67,29 @@ struct TurboFlintCLI: AsyncParsableCommand {
         log(String(format: "loaded in %.1fs, resident %.2f GB, expert cache %.2f GB reserved",
                    Date().timeIntervalSince(loadStart), Double(runner.residentBytes) / 1e9,
                    Double(runner.expertCacheBytes) / 1e9))
+        if profileKernels {
+            for (name, ms) in try runner.profileKernels() { log(String(format: "%-28@ %8.3f ms", name as NSString, ms)) }
+            return
+        }
         log("prompt: \(ids.count) tokens")
 
         let eos = Set(checkpoint.config.eosTokenID)
         let prefillStart = Date()
         var next = 0
         for (pos, t) in ids.enumerated() {
-            if let n = try runner.step(token: t, position: pos, wantLogits: pos == ids.count - 1) { next = n }
+            let last = pos == ids.count - 1
+            if last, dumpHidden != nil { runner.debugHidden = runner.makeDebugHiddenBuffer() }
+            if let n = try runner.step(token: t, position: pos, wantLogits: last) { next = n }
+        }
+        if let dumpHidden, let buf = runner.debugHidden {
+            let c = checkpoint.config
+            let p = buf.contents().assumingMemoryBound(to: Float.self)
+            let rows = (0..<c.numHiddenLayers).map { l in (0..<c.hiddenSize).map { Double(p[l * c.hiddenSize + $0]) } }
+            let logits = runner.lastLogits().map { $0.isFinite ? Double($0) : -1e30 }
+            let obj: [String: Any] = ["hidden": rows.map { $0.map { $0.isFinite ? $0 : 1e30 } },
+                                      "logits_top": Array(logits.enumerated().sorted { $0.element > $1.element }.prefix(5).map { [$0.offset, $0.element] })]
+            try JSONSerialization.data(withJSONObject: obj).write(to: URL(fileURLWithPath: dumpHidden))
+            runner.debugHidden = nil
         }
         let prefill = Date().timeIntervalSince(prefillStart)
         let afterPrefill = runner.expertStats
@@ -75,6 +97,7 @@ struct TurboFlintCLI: AsyncParsableCommand {
 
         var generated: [Int] = []
         var gpu = 0.0, io = 0.0
+        var gA = 0.0, gS = 0.0, gR = 0.0, gH = 0.0
         let decodeStart = Date()
         while true {
             generated.append(next)
@@ -83,6 +106,8 @@ struct TurboFlintCLI: AsyncParsableCommand {
             next = try runner.step(token: next, position: ids.count + generated.count - 1)!
             gpu += runner.lastTiming.gpuWaitSeconds
             io += runner.lastTiming.ioSeconds
+            gA += runner.lastTiming.gpuAttention; gS += runner.lastTiming.gpuShared
+            gR += runner.lastTiming.gpuRouted; gH += runner.lastTiming.gpuHead
         }
         let decode = Date().timeIntervalSince(decodeStart)
         let steps = max(1, generated.count - 1)
@@ -92,6 +117,9 @@ struct TurboFlintCLI: AsyncParsableCommand {
         log(String(format: "decode %d tokens in %.2fs: %.2f tok/s (gpu wait %.1f ms/tok, expert io %.1f ms/tok)",
                    generated.count, decode, Double(steps) / decode, gpu / Double(steps) * 1000,
                    io / Double(steps) * 1000))
+        log(String(format: "gpu busy ms/tok: attention+router %.1f, shared %.1f, routed %.1f, head %.1f",
+                   gA / Double(steps) * 1000, gS / Double(steps) * 1000, gR / Double(steps) * 1000,
+                   gH / Double(steps) * 1000))
         log(String(format: "decode expert cache: hit rate %.1f%%, %.0f MB read/tok",
                    100 * Double(hits) / Double(max(1, hits + misses)),
                    Double(s.bytesRead - afterPrefill.bytesRead) / Double(steps) / 1e6))

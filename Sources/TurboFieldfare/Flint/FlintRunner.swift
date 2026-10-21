@@ -11,6 +11,8 @@ package struct FlintRunnerOptions: Sendable {
 }
 
 package struct FlintStepTiming: Sendable {
+    /// GPU execution time by command-buffer kind: attention+router, shared expert, routed experts, head.
+    package var gpuAttention = 0.0, gpuShared = 0.0, gpuRouted = 0.0, gpuHead = 0.0
     package var gpuWaitSeconds = 0.0
     package var ioSeconds = 0.0
     package var totalSeconds = 0.0
@@ -49,15 +51,17 @@ package final class FlintRunner {
     private let lmHead: FlintQMatrix
 
     // Pipelines
-    private let pGemv, pGateUp, pEmbed, pNorm, pQK, pCombine, pRouter, pMoEGateUp, pMoEDown,
+    private let pGemv, pGateUp, pEmbed, pNorm, pQK, pCombine, pRouterScores, pRouterSelect, pMoEGateUp, pMoEDown,
                 pAdd, pAdd2, pAttnFull, pAttnRing: MTLComputePipelineState
 
     // Scratch
     private let h, xn, qp, kp, vp, qr, attn, tmp, mid, sharedOut, moeMid, routed, logits: MTLBuffer
-    private let routerIDs, routerWeights, slotBase, attnM, attnD, attnO: MTLBuffer
+    private let routerScores, routerIDs, routerWeights, slotBase, attnM, attnD, attnO: MTLBuffer
     private static let maxChunks = 32
 
     package private(set) var lastTiming = FlintStepTiming()
+    /// When set, `step` copies the residual stream after every layer here (FP32, layers x hidden).
+    package var debugHidden: MTLBuffer?
 
     package init(checkpoint: FlintOllamaCheckpoint, context: MetalContext, options: FlintRunnerOptions) throws {
         try checkpoint.config.validateForRuntime()
@@ -74,7 +78,8 @@ package final class FlintRunner {
         pNorm = try context.pipeline("flint_rmsnorm")
         pQK = try context.pipeline("flint_qk_norm_rope")
         pCombine = try context.pipeline("flint_attention_combine_sink")
-        pRouter = try context.pipeline("flint_router_topk")
+        pRouterScores = try context.pipeline("flint_router_scores")
+        pRouterSelect = try context.pipeline("flint_router_select")
         pMoEGateUp = try context.pipeline("flint_moe_gate_up")
         pMoEDown = try context.pipeline("flint_moe_down")
         pAdd = try context.pipeline("flint_residual_add")
@@ -123,21 +128,22 @@ package final class FlintRunner {
             else { throw FlintRuntimeError.metal("scratch allocation") }
             return b
         }
-        let H = c.hiddenSize, half = 2
+        let H = c.hiddenSize, f32 = 4
         let qDim = c.numAttentionHeads * c.headDim, kvDim = c.numKeyValueHeads * c.headDim
-        h = try buf(H * 4)
-        xn = try buf(H * half)
-        qp = try buf(qDim * half)
-        kp = try buf(kvDim * half)
-        vp = try buf(kvDim * half)
-        qr = try buf(qDim * half)
-        attn = try buf(qDim * half)
-        tmp = try buf(H * half)
-        mid = try buf(max(c.intermediateSize, c.sharedExpertIntermediateSize) * half)
-        sharedOut = try buf(H * half)
-        moeMid = try buf(c.numExpertsPerTok * c.moeIntermediateSize * half)
-        routed = try buf(H * half)
-        logits = try buf(c.vocabSize * half, shared: true)
+        h = try buf(H * f32)
+        xn = try buf(H * f32)
+        qp = try buf(qDim * f32)
+        kp = try buf(kvDim * f32)
+        vp = try buf(kvDim * f32)
+        qr = try buf(qDim * 2)  // FP16 query, the format attention_decode_partial reads
+        attn = try buf(qDim * f32)
+        tmp = try buf(H * f32)
+        mid = try buf(max(c.intermediateSize, c.sharedExpertIntermediateSize) * f32)
+        sharedOut = try buf(H * f32)
+        moeMid = try buf(c.numExpertsPerTok * c.moeIntermediateSize * f32)
+        routed = try buf(H * f32)
+        logits = try buf(c.vocabSize * f32, shared: true)
+        routerScores = try buf(c.numExperts * 4)
         routerIDs = try buf(16 * 4, shared: true)
         routerWeights = try buf(16 * 4)
         slotBase = try buf(16 * 4, shared: true)
@@ -219,6 +225,24 @@ package final class FlintRunner {
                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
+    private func encodeRouter(_ enc: MTLComputeCommandEncoder, _ router: FlintBufferRef) {
+        let c = config
+        enc.setComputePipelineState(pRouterScores)
+        enc.setBuffer(xn, offset: 0, index: 0)
+        set(enc, router, 1)
+        enc.setBuffer(routerScores, offset: 0, index: 2)
+        setU32(enc, c.numExperts, 3); setU32(enc, c.hiddenSize, 4)
+        enc.dispatchThreadgroups(MTLSize(width: (c.numExperts + 7) / 8, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.setComputePipelineState(pRouterSelect)
+        enc.setBuffer(routerScores, offset: 0, index: 0)
+        enc.setBuffer(routerIDs, offset: 0, index: 1)
+        enc.setBuffer(routerWeights, offset: 0, index: 2)
+        setU32(enc, c.numExperts, 3); setU32(enc, c.numExpertsPerTok, 4)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+    }
+
     private struct QKParams {
         var numQHeads: UInt32, numKVHeads: UInt32, headDim: UInt32, cacheSlot: UInt32, position: UInt32
         var useRope: UInt32
@@ -283,6 +307,17 @@ package final class FlintRunner {
         rmsnorm(enc, weight: L.postNorm, out: xn)
     }
 
+    private func copyHidden(_ cb: MTLCommandBuffer, layer: Int) {
+        guard let dst = debugHidden, let blit = cb.makeBlitCommandEncoder() else { return }
+        let bytes = config.hiddenSize * 4
+        blit.copy(from: h, sourceOffset: 0, to: dst, destinationOffset: layer * bytes, size: bytes)
+        blit.endEncoding()
+    }
+
+    package func makeDebugHiddenBuffer() -> MTLBuffer? {
+        context.device.makeBuffer(length: config.numHiddenLayers * config.hiddenSize * 4, options: .storageModeShared)
+    }
+
     private func commandBuffer() throws -> (MTLCommandBuffer, MTLComputeCommandEncoder) {
         guard let cb = context.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else {
             throw FlintRuntimeError.metal("command buffer")
@@ -290,7 +325,10 @@ package final class FlintRunner {
         return (cb, enc)
     }
 
-    private func finish(_ cb: MTLCommandBuffer, wait: Bool, timing: inout FlintStepTiming) throws {
+    private var pendingTimed: [(MTLCommandBuffer, Int)] = []
+
+    private func finish(_ cb: MTLCommandBuffer, wait: Bool, timing: inout FlintStepTiming, kind: Int = 0) throws {
+        pendingTimed.append((cb, kind))
         cb.commit()
         if wait {
             let t = DispatchTime.now().uptimeNanoseconds
@@ -319,31 +357,30 @@ package final class FlintRunner {
                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
         let k = c.numExpertsPerTok
-        for L in layers {
+        for (layerIndex, L) in layers.enumerated() {
             encodeAttention(enc, L, position: position)
             guard let experts = L.experts, let router = L.router else {
                 gateUp(enc, L.gate, L.up, x: xn, out: mid)
                 gemv(enc, L.down, x: mid, y: tmp)
                 addResidual(enc, tmp)
+                if debugHidden != nil {
+                    enc.endEncoding()
+                    copyHidden(cb, layer: layerIndex)
+                    try finish(cb, wait: false, timing: &timing, kind: 2)
+                    (cb, enc) = try commandBuffer()
+                }
                 continue
             }
-            enc.setComputePipelineState(pRouter)
-            enc.setBuffer(xn, offset: 0, index: 0)
-            set(enc, router, 1)
-            enc.setBuffer(routerIDs, offset: 0, index: 2)
-            enc.setBuffer(routerWeights, offset: 0, index: 3)
-            setU32(enc, c.numExperts, 4); setU32(enc, c.hiddenSize, 5); setU32(enc, k, 6)
-            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                     threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+            encodeRouter(enc, router)
             enc.endEncoding()
-            try finish(cb, wait: true, timing: &timing)
+            try finish(cb, wait: true, timing: &timing, kind: 0)
 
             // Shared expert runs on the GPU while the CPU loads missing routed experts.
             (cb, enc) = try commandBuffer()
             gateUp(enc, L.gate, L.up, x: xn, out: mid)
             gemv(enc, L.down, x: mid, y: sharedOut)
             enc.endEncoding()
-            try finish(cb, wait: false, timing: &timing)
+            try finish(cb, wait: false, timing: &timing, kind: 1)
 
             let idPtr = routerIDs.contents().assumingMemoryBound(to: UInt32.self)
             let ids = (0..<k).map { Int(idPtr[$0]) }
@@ -375,6 +412,10 @@ package final class FlintRunner {
             enc.dispatchThreadgroups(MTLSize(width: (c.hiddenSize + 7) / 8, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
             addResidual(enc, routed, sharedOut)
+            enc.endEncoding()
+            if debugHidden != nil { copyHidden(cb, layer: layerIndex) }
+            try finish(cb, wait: false, timing: &timing, kind: 2)
+            (cb, enc) = try commandBuffer()
         }
 
         var result: Int?
@@ -382,12 +423,22 @@ package final class FlintRunner {
             rmsnorm(enc, weight: finalNorm, out: xn)
             gemv(enc, lmHead, x: xn, y: logits)
             enc.endEncoding()
-            try finish(cb, wait: true, timing: &timing)
+            try finish(cb, wait: true, timing: &timing, kind: 3)
             result = argmax()
         } else {
             enc.endEncoding()
             try finish(cb, wait: true, timing: &timing)
         }
+        for (b, kind) in pendingTimed {
+            let t = b.gpuEndTime - b.gpuStartTime
+            switch kind {
+            case 0: timing.gpuAttention += t
+            case 1: timing.gpuShared += t
+            case 2: timing.gpuRouted += t
+            default: timing.gpuHead += t
+            }
+        }
+        pendingTimed.removeAll(keepingCapacity: true)
         timing.totalSeconds = Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
         lastTiming = timing
         return result
@@ -395,15 +446,44 @@ package final class FlintRunner {
 
     /// FP32 copy of the last logits (valid after a `step` with `wantLogits`).
     package func lastLogits() -> [Float] {
-        let p = logits.contents().assumingMemoryBound(to: Float16.self)
-        return (0..<config.vocabSize).map { Float(p[$0]) }
+        let p = logits.contents().assumingMemoryBound(to: Float.self)
+        return Array(UnsafeBufferPointer(start: p, count: config.vocabSize))
     }
 
     private func argmax() -> Int {
-        let p = logits.contents().assumingMemoryBound(to: Float16.self)
+        let p = logits.contents().assumingMemoryBound(to: Float.self)
         var best = 0
         var bv = p[0]
         for i in 1..<config.vocabSize where p[i] > bv { bv = p[i]; best = i }
         return best
+    }
+}
+
+// MARK: - Kernel profiling
+
+extension FlintRunner {
+    /// GPU time (ms) of each attention-block kernel on MoE layer `layerIndex`, averaged over
+    /// `reps` dispatches in one command buffer. For finding hot spots, not for benchmarks.
+    package func profileKernels(layerIndex: Int = 2, position: Int = 100, reps: Int = 200) throws -> [(String, Double)] {
+        let L = layers[layerIndex]
+        func time(_ name: String, _ body: (MTLComputeCommandEncoder) -> Void) throws -> (String, Double) {
+            let (cb, enc) = try commandBuffer()
+            for _ in 0..<reps { body(enc) }
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            return (name, (cb.gpuEndTime - cb.gpuStartTime) / Double(reps) * 1000)
+        }
+        var out: [(String, Double)] = []
+        out.append(try time("rmsnorm") { self.rmsnorm($0, weight: L.inputNorm, out: self.xn) })
+        out.append(try time("q_proj 4096x2048") { self.gemv($0, L.q, x: self.xn, y: self.qp) })
+        out.append(try time("k_proj 512x2048") { self.gemv($0, L.k, x: self.xn, y: self.kp) })
+        out.append(try time("o_proj 2048x4096") { self.gemv($0, L.o, x: self.attn, y: self.tmp) })
+        out.append(try time("residual_add") { self.addResidual($0, self.tmp) })
+        out.append(try time("full attention block") { self.encodeAttention($0, L, position: position) })
+        out.append(try time("router+top6") { self.encodeRouter($0, L.router!) })
+        out.append(try time("shared gate_up 1024x2048") { self.gateUp($0, L.gate, L.up, x: self.xn, out: self.mid) })
+        out.append(try time("lm_head 150144x2048") { self.gemv($0, self.lmHead, x: self.xn, y: self.logits) })
+        return out
     }
 }
