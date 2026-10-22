@@ -31,7 +31,7 @@ struct TurboFlintCLI: AsyncParsableCommand {
     var maxContext = 8192
 
     @Option(help: "Prompt tokens per prefill chunk (1 = token-by-token).")
-    var prefillChunk = 256
+    var prefillChunk = 512
 
     @Option(help: "Parallel pread lanes for expert loads.")
     var readConcurrency = 8

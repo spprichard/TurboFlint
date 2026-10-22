@@ -9,7 +9,7 @@ package struct FlintRunnerOptions: Sendable {
     package var readConcurrency = 8
     /// Prompt tokens processed per prefill chunk. Sliding-window KV rings hold
     /// `sliding_window + prefillChunk` rows so a whole chunk can be written before attention.
-    package var prefillChunk = 256
+    package var prefillChunk = 512
     /// Extra sliding-window ring rows so a later prompt can rewind this many positions and reuse
     /// the cached prefix (servers reusing KV across turns). Costs ~10 KB per row across all layers.
     package var rewindSlack = 0
