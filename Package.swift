@@ -15,6 +15,7 @@ let package = Package(
         .executable(name: "TurboFieldfareDecodeService", targets: ["TurboFieldfareDecodeService"]),
         .executable(name: "TurboFieldfareServer", targets: ["TurboFieldfareServer"]),
         .executable(name: "turboflint", targets: ["TurboFlintCLI"]),
+        .executable(name: "turboflint-server", targets: ["TurboFlintServer"]),
     ],
     dependencies: [
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
@@ -68,6 +69,14 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ],
             path: "Sources/TurboFlintCLI"
+        ),
+        .executableTarget(
+            name: "TurboFlintServer",
+            dependencies: [
+                "TurboFieldfareServerCore",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "Sources/TurboFlintServer"
         ),
         .executableTarget(
             name: "TurboFieldfareCLI",

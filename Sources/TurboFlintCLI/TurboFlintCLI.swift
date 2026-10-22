@@ -48,6 +48,9 @@ struct TurboFlintCLI: AsyncParsableCommand {
     @Option(help: "Write per-layer residual stream of the last prompt token to this JSON file (debug).")
     var dumpHidden: String?
 
+    @Option(help: "Debug: JSON {routing: {layer: {ids, weights}}} to force expert choices during prefill.")
+    var forceRouting: String?
+
     @Flag(help: "Measure next-layer expert prediction accuracy (debug).")
     var measurePrediction = false
 
@@ -87,6 +90,16 @@ struct TurboFlintCLI: AsyncParsableCommand {
             return
         }
         runner.measurePrediction = measurePrediction
+        if let forceRouting {
+            struct Dump: Decodable {
+                struct Layer: Decodable { let ids: [[Int]]; let weights: [[Float]] }
+                let routing: [String: Layer]
+            }
+            let dump = try JSONDecoder().decode(Dump.self, from: Data(contentsOf: URL(fileURLWithPath: forceRouting)))
+            var table: [Int: [(ids: [Int], weights: [Float])]] = [:]
+            for (layer, v) in dump.routing { table[Int(layer)!] = zip(v.ids, v.weights).map { ($0, $1) } }
+            runner.forcedRouting = table
+        }
         log("prompt: \(ids.count) tokens")
 
         let eos = Set(checkpoint.config.eosTokenID)

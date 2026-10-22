@@ -10,6 +10,9 @@ package struct FlintRunnerOptions: Sendable {
     /// Prompt tokens processed per prefill chunk. Sliding-window KV rings hold
     /// `sliding_window + prefillChunk` rows so a whole chunk can be written before attention.
     package var prefillChunk = 256
+    /// Extra sliding-window ring rows so a later prompt can rewind this many positions and reuse
+    /// the cached prefix (servers reusing KV across turns). Costs ~10 KB per row across all layers.
+    package var rewindSlack = 0
     /// Read routed experts with F_NOCACHE so the OS page cache does not hold a second copy.
     package var bypassPageCache = false
     /// Run each layer's successor router on its input and start loading the predicted experts.
@@ -74,6 +77,9 @@ package final class FlintRunner {
     /// When true, each MoE layer also runs the next layer's router on its own post-attention input
     /// and records how many of that layer's real top-k experts the guess contained.
     package var measurePrediction = false
+    /// Debug: teacher-forced routing, `[layer][position] -> (ids, weights)`. When set, `step`
+    /// replaces the router's choice with these, isolating numerics from routing near-ties.
+    package var forcedRouting: [Int: [(ids: [Int], weights: [Float])]]?
     package private(set) var predictionOverlap = 0
     package private(set) var predictionTotal = 0
     private var lastPrediction: [Int] = []
@@ -109,7 +115,8 @@ package final class FlintRunner {
         pAttnRing = try context.pipeline(
             "attention_decode_partial",
             constants: [MetalFunctionConstant(
-                index: 69, value: .uint32(UInt32(checkpoint.config.slidingWindow + options.prefillChunk)))])
+                index: 69, value: .uint32(UInt32(
+                    checkpoint.config.slidingWindow + options.prefillChunk + options.rewindSlack)))])
 
         embed = try store.matrix("model.embed_tokens.weight")
         finalNorm = try store.ref("model.norm.weight")
@@ -124,7 +131,8 @@ package final class FlintRunner {
             let a = p + "self_attn."
             let dense = c.isDense(layer: i)
             let mlp = dense ? p + "mlp." : p + "mlp.shared_expert."
-            let rows = c.isSliding(layer: i) ? c.slidingWindow + options.prefillChunk : options.maxContext
+            let rows = c.isSliding(layer: i)
+                ? c.slidingWindow + options.prefillChunk + options.rewindSlack : options.maxContext
             guard let kc = device.makeBuffer(length: rows * kvRow, options: .storageModePrivate),
                   let vc = device.makeBuffer(length: rows * kvRow, options: .storageModePrivate)
             else { throw FlintRuntimeError.metal("KV cache allocation") }
@@ -173,7 +181,7 @@ package final class FlintRunner {
         predIDs = try buf(16 * 4, shared: true)
         predWeights = try buf(16 * 4)
         routerIDs = try buf(16 * 4, shared: true)
-        routerWeights = try buf(16 * 4)
+        routerWeights = try buf(16 * 4, shared: true)
         slotBase = try buf(16 * 4, shared: true)
         attnM = try buf(c.numAttentionHeads * Self.maxChunks * 4)
         attnD = try buf(c.numAttentionHeads * Self.maxChunks * 4)
@@ -238,7 +246,11 @@ package final class FlintRunner {
 
     package var residentBytes: Int { store.mappedBytes }
 
-    private var ringCap: Int { config.slidingWindow + options.prefillChunk }
+    private var ringCap: Int { config.slidingWindow + options.prefillChunk + options.rewindSlack }
+
+    /// How far back a later `prefill` may restart while every sliding-window key it needs is still
+    /// in the rings. Callers must re-prefill from 0 when (last written position - restart) exceeds it.
+    package var maxRewind: Int { options.prefillChunk + options.rewindSlack - 1 }
 
     package var expertCacheBytes: Int { layers.compactMap(\.experts).reduce(0) { $0 + $1.pool.length } }
 
@@ -501,7 +513,12 @@ package final class FlintRunner {
             try finish(cb, wait: false, timing: &timing, kind: 1)
 
             let idPtr = routerIDs.contents().assumingMemoryBound(to: UInt32.self)
-            let ids = (0..<k).map { Int(idPtr[$0]) }
+            var ids = (0..<k).map { Int(idPtr[$0]) }
+            if let forced = forcedRouting?[layerIndex], position < forced.count {
+                ids = forced[position].ids
+                let wp = routerWeights.contents().assumingMemoryBound(to: Float.self)
+                for j in 0..<k { idPtr[j] = UInt32(ids[j]); wp[j] = forced[position].weights[j] }
+            }
             if measurePrediction {
                 if !lastPrediction.isEmpty {
                     predictionOverlap += Set(lastPrediction).intersection(ids).count
