@@ -61,7 +61,8 @@ package final class FlintRunner {
 
     // Pipelines
     private let pGemv, pGateUp, pEmbed, pNorm, pQK, pCombine, pRouterScores, pRouterSelect, pMoEGateUp, pMoEDown,
-                pAdd, pAdd2, pAttnFull, pAttnRing: MTLComputePipelineState
+                pAdd, pAdd2, pAttnFull, pAttnRing,
+                pQKV, pGemvRes, pMoEDownRes, pRouterScores2: MTLComputePipelineState
 
     // Scratch
     private let h, xn, qp, kp, vp, qr, attn, tmp, mid, sharedOut, moeMid, routed, logits: MTLBuffer
@@ -101,6 +102,10 @@ package final class FlintRunner {
         pAdd = try context.pipeline("flint_residual_add")
         pAdd2 = try context.pipeline("flint_residual_add2")
         pAttnFull = try context.pipeline("attention_decode_partial")
+        pQKV = try context.pipeline("flint_int4_gemv_qkv")
+        pGemvRes = try context.pipeline("flint_int4_gemv_residual")
+        pMoEDownRes = try context.pipeline("flint_moe_down_residual")
+        pRouterScores2 = try context.pipeline("flint_router_scores2")
         pAttnRing = try context.pipeline(
             "attention_decode_partial",
             constants: [MetalFunctionConstant(
@@ -164,7 +169,7 @@ package final class FlintRunner {
         moeMid = try buf(c.numExpertsPerTok * c.moeIntermediateSize * f32)
         routed = try buf(H * f32)
         logits = try buf(c.vocabSize * f32, shared: true)
-        routerScores = try buf(c.numExperts * 4)
+        routerScores = try buf(2 * c.numExperts * 4)
         predIDs = try buf(16 * 4, shared: true)
         predWeights = try buf(16 * 4)
         routerIDs = try buf(16 * 4, shared: true)
@@ -262,6 +267,17 @@ package final class FlintRunner {
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
+    /// h += m . x
+    private func gemvResidual(_ enc: MTLComputeCommandEncoder, _ m: FlintQMatrix, x: MTLBuffer) {
+        enc.setComputePipelineState(pGemvRes)
+        set(enc, m.w, 0); set(enc, m.s, 1); set(enc, m.b, 2)
+        enc.setBuffer(x, offset: 0, index: 3)
+        enc.setBuffer(h, offset: 0, index: 4)
+        setU32(enc, m.outFeatures, 5); setU32(enc, m.inFeatures, 6)
+        enc.dispatchThreadgroups(MTLSize(width: (m.outFeatures + 7) / 8, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
     private func gateUp(_ enc: MTLComputeCommandEncoder, _ g: FlintQMatrix, _ u: FlintQMatrix,
                         x: MTLBuffer, out: MTLBuffer) {
         enc.setComputePipelineState(pGateUp)
@@ -315,6 +331,30 @@ package final class FlintRunner {
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
     }
 
+    /// Scores this layer's router and, when `next` is given, the next layer's router on the same
+    /// input; selects top-k for both (ids/weights and predIDs/predWeights).
+    private func encodeRouterPair(_ enc: MTLComputeCommandEncoder, _ router: FlintBufferRef, _ next: FlintBufferRef?) {
+        let c = config
+        let sets = next == nil ? 1 : 2
+        enc.setComputePipelineState(pRouterScores2)
+        enc.setBuffer(xn, offset: 0, index: 0)
+        set(enc, router, 1)
+        set(enc, next ?? router, 2)
+        enc.setBuffer(routerScores, offset: 0, index: 3)
+        setU32(enc, c.numExperts, 4); setU32(enc, c.hiddenSize, 5)
+        enc.dispatchThreadgroups(MTLSize(width: (sets * c.numExperts + 7) / 8, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.setComputePipelineState(pRouterSelect)
+        for s in 0..<sets {
+            enc.setBuffer(routerScores, offset: s * c.numExperts * 4, index: 0)
+            enc.setBuffer(s == 0 ? routerIDs : predIDs, offset: 0, index: 1)
+            enc.setBuffer(s == 0 ? routerWeights : predWeights, offset: 0, index: 2)
+            setU32(enc, c.numExperts, 3); setU32(enc, c.numExpertsPerTok, 4)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                     threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        }
+    }
+
     private struct QKParams {
         var numQHeads: UInt32, numKVHeads: UInt32, headDim: UInt32, cacheSlot: UInt32, position: UInt32
         var useRope: UInt32
@@ -324,9 +364,15 @@ package final class FlintRunner {
     private func encodeAttention(_ enc: MTLComputeCommandEncoder, _ L: Layer, position: Int) {
         let c = config
         rmsnorm(enc, weight: L.inputNorm, out: xn)
-        gemv(enc, L.q, x: xn, y: qp)
-        gemv(enc, L.k, x: xn, y: kp)
-        gemv(enc, L.v, x: xn, y: vp)
+        enc.setComputePipelineState(pQKV)
+        set(enc, L.q.w, 0); set(enc, L.q.s, 1); set(enc, L.q.b, 2)
+        set(enc, L.k.w, 3); set(enc, L.k.s, 4); set(enc, L.k.b, 5)
+        set(enc, L.v.w, 6); set(enc, L.v.s, 7); set(enc, L.v.b, 8)
+        enc.setBuffer(xn, offset: 0, index: 9)
+        enc.setBuffer(qp, offset: 0, index: 10); enc.setBuffer(kp, offset: 0, index: 11); enc.setBuffer(vp, offset: 0, index: 12)
+        setU32(enc, L.q.outFeatures, 13); setU32(enc, L.k.outFeatures, 14); setU32(enc, L.q.inFeatures, 15)
+        enc.dispatchThreadgroups(MTLSize(width: (L.q.outFeatures + 2 * L.k.outFeatures + 7) / 8, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
         let slot = L.sliding ? position % ringCap : position
         var params = QKParams(numQHeads: UInt32(c.numAttentionHeads), numKVHeads: UInt32(c.numKeyValueHeads),
@@ -374,8 +420,7 @@ package final class FlintRunner {
         enc.dispatchThreadgroups(MTLSize(width: c.numAttentionHeads, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: c.headDim, height: 1, depth: 1))
 
-        gemv(enc, L.o, x: attn, y: tmp)
-        addResidual(enc, tmp)
+        gemvResidual(enc, L.o, x: attn)
         rmsnorm(enc, weight: L.postNorm, out: xn)
     }
 
@@ -433,8 +478,7 @@ package final class FlintRunner {
             encodeAttention(enc, L, position: position)
             guard let experts = L.experts, let router = L.router else {
                 gateUp(enc, L.gate, L.up, x: xn, out: mid)
-                gemv(enc, L.down, x: mid, y: tmp)
-                addResidual(enc, tmp)
+                gemvResidual(enc, L.down, x: mid)
                 if debugHidden != nil {
                     enc.endEncoding()
                     copyHidden(cb, layer: layerIndex)
@@ -443,11 +487,9 @@ package final class FlintRunner {
                 }
                 continue
             }
-            encodeRouter(enc, router)
             let nextRouter = layerIndex + 1 < layers.count ? layers[layerIndex + 1].router : nil
-            if measurePrediction || options.prefetchNextLayer, let nextRouter {
-                encodeRouter(enc, nextRouter, ids: predIDs, weights: predWeights)
-            }
+            let predict = (measurePrediction || options.prefetchNextLayer) ? nextRouter : nil
+            encodeRouterPair(enc, router, predict)
             enc.endEncoding()
             try finish(cb, wait: true, timing: &timing, kind: 0)
 
@@ -490,17 +532,17 @@ package final class FlintRunner {
             setU32(enc, c.moeIntermediateSize, 5); setU32(enc, c.hiddenSize, 6); setU32(enc, k, 7)
             enc.dispatchThreadgroups(MTLSize(width: (k * c.moeIntermediateSize + 7) / 8, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            enc.setComputePipelineState(pMoEDown)
+            enc.setComputePipelineState(pMoEDownRes)
             enc.setBuffer(experts.pool, offset: 0, index: 0)
             enc.setBuffer(slotBase, offset: 0, index: 1)
             enc.setBuffer(routerWeights, offset: 0, index: 2)
             enc.setBuffer(moeMid, offset: 0, index: 3)
-            enc.setBuffer(routed, offset: 0, index: 4)
-            enc.setBytes(&lay, length: lay.count * 4, index: 5)
-            setU32(enc, c.moeIntermediateSize, 6); setU32(enc, c.hiddenSize, 7); setU32(enc, k, 8)
+            enc.setBuffer(sharedOut, offset: 0, index: 4)
+            enc.setBuffer(h, offset: 0, index: 5)
+            enc.setBytes(&lay, length: lay.count * 4, index: 6)
+            setU32(enc, c.moeIntermediateSize, 7); setU32(enc, c.hiddenSize, 8); setU32(enc, k, 9)
             enc.dispatchThreadgroups(MTLSize(width: (c.hiddenSize + 7) / 8, height: 1, depth: 1),
                                      threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
-            addResidual(enc, routed, sharedOut)
             enc.endEncoding()
             if debugHidden != nil { copyHidden(cb, layer: layerIndex) }
             try finish(cb, wait: false, timing: &timing, kind: 2)

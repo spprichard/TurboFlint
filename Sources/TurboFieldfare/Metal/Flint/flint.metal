@@ -820,3 +820,110 @@ kernel void flint_moe_reduce_rows(device float*       h      [[buffer(0)]],
     for (uint k = 0; k < K; ++k) s += routed[(t * K + k) * D + gid.x];
     h[t * D + gid.x] += s;
 }
+
+// ============================================================================
+// Decode fusions: fewer dispatches per layer.
+// ============================================================================
+
+// Q, K and V projections in one dispatch. Rows [0, Mq) -> q, [Mq, Mq+Mk) -> k,
+// the rest -> v. All three share the input x and inner dimension N.
+kernel void flint_int4_gemv_qkv(device const uint8_t* Wq [[buffer(0)]],
+                                device const bfloat*  Sq [[buffer(1)]],
+                                device const bfloat*  Bq [[buffer(2)]],
+                                device const uint8_t* Wk [[buffer(3)]],
+                                device const bfloat*  Sk [[buffer(4)]],
+                                device const bfloat*  Bk [[buffer(5)]],
+                                device const uint8_t* Wv [[buffer(6)]],
+                                device const bfloat*  Sv [[buffer(7)]],
+                                device const bfloat*  Bv [[buffer(8)]],
+                                device const float*   x  [[buffer(9)]],
+                                device float*         q  [[buffer(10)]],
+                                device float*         k  [[buffer(11)]],
+                                device float*         v  [[buffer(12)]],
+                                constant uint&        Mq [[buffer(13)]],
+                                constant uint&        Mk [[buffer(14)]],
+                                constant uint&        N  [[buffer(15)]],
+                                uint tg   [[threadgroup_position_in_grid]],
+                                uint sg   [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg * 8u + sg;
+    if (row >= Mq + 2u * Mk) return;
+    const uint groups = N / kFlintGroup;
+    device const uint8_t* W; device const bfloat* S; device const bfloat* B; device float* y;
+    if (row < Mq) { W = Wq; S = Sq; B = Bq; y = q; }
+    else if (row < Mq + Mk) { row -= Mq; W = Wk; S = Sk; B = Bk; y = k; }
+    else { row -= Mq + Mk; W = Wv; S = Sv; B = Bv; y = v; }
+    const float r = flint_int4_dot(W + ulong(row) * (N / 2u), S + ulong(row) * groups,
+                                   B + ulong(row) * groups, x, N, lane);
+    if (lane == 0) y[row] = r;
+}
+
+// h[m] += W[m] . x  (projection fused with the residual add).
+kernel void flint_int4_gemv_residual(device const uint8_t* W [[buffer(0)]],
+                                     device const bfloat*  S [[buffer(1)]],
+                                     device const bfloat*  B [[buffer(2)]],
+                                     device const float*   x [[buffer(3)]],
+                                     device float*         h [[buffer(4)]],
+                                     constant uint&        M [[buffer(5)]],
+                                     constant uint&        N [[buffer(6)]],
+                                     uint tg   [[threadgroup_position_in_grid]],
+                                     uint sg   [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tg * 8u + sg;
+    if (row >= M) return;
+    const uint groups = N / kFlintGroup;
+    const float v = flint_int4_dot(W + ulong(row) * (N / 2u), S + ulong(row) * groups,
+                                   B + ulong(row) * groups, x, N, lane);
+    if (lane == 0) h[row] += v;
+}
+
+// Routed down-reduce fused with the residual: h[m] += shared[m] + sum_e w_e * (down_e[m] . h_e).
+kernel void flint_moe_down_residual(device const uint8_t* pool      [[buffer(0)]],
+                                    device const uint*    slot_base [[buffer(1)]],
+                                    device const float*   weights   [[buffer(2)]],
+                                    device const float*   hmid      [[buffer(3)]],
+                                    device const float*   shared    [[buffer(4)]],
+                                    device float*         h         [[buffer(5)]],
+                                    constant FlintExpertLayout& L   [[buffer(6)]],
+                                    constant uint&        I         [[buffer(7)]],
+                                    constant uint&        M         [[buffer(8)]],
+                                    constant uint&        K         [[buffer(9)]],
+                                    uint tg   [[threadgroup_position_in_grid]],
+                                    uint sg   [[simdgroup_index_in_threadgroup]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tg * 8u + sg;
+    if (row >= M) return;
+    const uint groups = I / kFlintGroup;
+    const uint wo = row * (I / 2u);
+    const uint so = row * groups;
+    float acc = 0.0f;
+    for (uint e = 0; e < K; ++e) {
+        device const uint8_t* base = pool + slot_base[e];
+        acc += weights[e] * flint_int4_dot(base + L.down_w + wo, (device const bfloat*)(base + L.down_s) + so,
+                                           (device const bfloat*)(base + L.down_b) + so, hmid + e * I, I, lane);
+    }
+    if (lane == 0) h[row] += acc + shared[row];
+}
+
+// Router scores for this layer (W0) and, optionally, the next layer's router on
+// the same input (W1, prediction). Grid: ceil(E/8) * sets threadgroups.
+kernel void flint_router_scores2(device const float*  x      [[buffer(0)]],
+                                 device const bfloat* W0     [[buffer(1)]],
+                                 device const bfloat* W1     [[buffer(2)]],
+                                 device float*        scores [[buffer(3)]],
+                                 constant uint&       E      [[buffer(4)]],
+                                 constant uint&       N      [[buffer(5)]],
+                                 uint tg   [[threadgroup_position_in_grid]],
+                                 uint sg   [[simdgroup_index_in_threadgroup]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg * 8u + sg;
+    const uint set = row / E;
+    if (set > 1u) return;
+    row -= set * E;
+    device const bfloat4* w = (device const bfloat4*)((set == 0u ? W0 : W1) + ulong(row) * N);
+    device const float4* xv = (device const float4*)x;
+    float acc = 0.0f;
+    for (uint i = lane; i < N / 4u; i += 32u) acc += dot(float4(w[i]), xv[i]);
+    acc = simd_sum(acc);
+    if (lane == 0) scores[set * E + row] = 1.0f / (1.0f + exp(-acc));
+}
