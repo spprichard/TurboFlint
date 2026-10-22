@@ -30,6 +30,9 @@ struct TurboFlintCLI: AsyncParsableCommand {
     @Option(help: "Maximum context length (KV cache rows for full-attention layers).")
     var maxContext = 8192
 
+    @Option(help: "Prompt tokens per prefill chunk (1 = token-by-token).")
+    var prefillChunk = 256
+
     @Option(help: "Parallel pread lanes for expert loads.")
     var readConcurrency = 8
 
@@ -70,6 +73,7 @@ struct TurboFlintCLI: AsyncParsableCommand {
         options.maxContext = maxContext
         options.slotsPerLayer = slots
         options.readConcurrency = readConcurrency
+        options.prefillChunk = prefillChunk
         options.bypassPageCache = noPageCache
         options.prefetchNextLayer = !noPrefetch
         let loadStart = Date()
@@ -88,10 +92,15 @@ struct TurboFlintCLI: AsyncParsableCommand {
         let eos = Set(checkpoint.config.eosTokenID)
         let prefillStart = Date()
         var next = 0
-        for (pos, t) in ids.enumerated() {
-            let last = pos == ids.count - 1
-            if last, dumpHidden != nil { runner.debugHidden = runner.makeDebugHiddenBuffer() }
-            if let n = try runner.step(token: t, position: pos, wantLogits: last) { next = n }
+        if dumpHidden != nil {
+            // Token-by-token so the per-layer residual of the last prompt row can be captured.
+            for (pos, t) in ids.enumerated() {
+                let last = pos == ids.count - 1
+                if last { runner.debugHidden = runner.makeDebugHiddenBuffer() }
+                if let n = try runner.step(token: t, position: pos, wantLogits: last) { next = n }
+            }
+        } else {
+            next = try runner.prefill(ids)
         }
         if let dumpHidden, let buf = runner.debugHidden {
             let c = checkpoint.config
@@ -104,6 +113,8 @@ struct TurboFlintCLI: AsyncParsableCommand {
             runner.debugHidden = nil
         }
         let prefill = Date().timeIntervalSince(prefillStart)
+        let firstTop = runner.lastLogits().enumerated().sorted { $0.element > $1.element }.prefix(5)
+            .map { [Double($0.offset), Double($0.element)] }
         let afterPrefill = runner.expertStats
         log(String(format: "prefill %.2fs (%.1f tok/s)", prefill, Double(ids.count) / prefill))
 
@@ -146,7 +157,7 @@ struct TurboFlintCLI: AsyncParsableCommand {
         }
         log(String(format: "peak footprint %.2f GB", Double(peakFootprint()) / 1e9))
         if json {
-            let out: [String: Any] = ["prompt_ids": ids, "generated_ids": generated]
+            let out: [String: Any] = ["prompt_ids": ids, "generated_ids": generated, "first_top": firstTop]
             print(String(data: try JSONSerialization.data(withJSONObject: out), encoding: .utf8)!)
         }
     }

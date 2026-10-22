@@ -7,6 +7,9 @@ package struct FlintRunnerOptions: Sendable {
     /// Routed-expert cache slots per MoE layer (each slot holds one 1.77 MB expert).
     package var slotsPerLayer = 32
     package var readConcurrency = 8
+    /// Prompt tokens processed per prefill chunk. Sliding-window KV rings hold
+    /// `sliding_window + prefillChunk` rows so a whole chunk can be written before attention.
+    package var prefillChunk = 256
     /// Read routed experts with F_NOCACHE so the OS page cache does not hold a second copy.
     package var bypassPageCache = false
     /// Run each layer's successor router on its input and start loading the predicted experts.
@@ -30,7 +33,9 @@ package struct FlintStepTiming: Sendable {
 /// command buffer runs -> cb2 = routed gate/up, weighted down-reduce, residual (committed, not
 /// awaited; queue order serialises it before the next layer's cb1).
 package final class FlintRunner {
-    private struct Layer {
+    typealias Layer = LayerView
+
+    struct LayerView {
         let inputNorm: FlintBufferRef
         let postNorm: FlintBufferRef
         let q, k, v, o: FlintQMatrix
@@ -64,6 +69,7 @@ package final class FlintRunner {
     private static let maxChunks = 32
 
     package private(set) var lastTiming = FlintStepTiming()
+    private var prefillEngine: FlintPrefill?
     /// When true, each MoE layer also runs the next layer's router on its own post-attention input
     /// and records how many of that layer's real top-k experts the guess contained.
     package var measurePrediction = false
@@ -97,7 +103,8 @@ package final class FlintRunner {
         pAttnFull = try context.pipeline("attention_decode_partial")
         pAttnRing = try context.pipeline(
             "attention_decode_partial",
-            constants: [MetalFunctionConstant(index: 69, value: .uint32(UInt32(checkpoint.config.slidingWindow)))])
+            constants: [MetalFunctionConstant(
+                index: 69, value: .uint32(UInt32(checkpoint.config.slidingWindow + options.prefillChunk)))])
 
         embed = try store.matrix("model.embed_tokens.weight")
         finalNorm = try store.ref("model.norm.weight")
@@ -112,7 +119,7 @@ package final class FlintRunner {
             let a = p + "self_attn."
             let dense = c.isDense(layer: i)
             let mlp = dense ? p + "mlp." : p + "mlp.shared_expert."
-            let rows = c.isSliding(layer: i) ? c.slidingWindow : options.maxContext
+            let rows = c.isSliding(layer: i) ? c.slidingWindow + options.prefillChunk : options.maxContext
             guard let kc = device.makeBuffer(length: rows * kvRow, options: .storageModePrivate),
                   let vc = device.makeBuffer(length: rows * kvRow, options: .storageModePrivate)
             else { throw FlintRuntimeError.metal("KV cache allocation") }
@@ -167,6 +174,57 @@ package final class FlintRunner {
         attnD = try buf(c.numAttentionHeads * Self.maxChunks * 4)
         attnO = try buf(c.numAttentionHeads * Self.maxChunks * c.headDim * 4)
         store.prefault()
+        if options.prefillChunk > 1 {
+            prefillEngine = try FlintPrefill(context: context, config: configView, maxTokens: options.prefillChunk)
+        }
+    }
+
+    private var configView: FlintConfigView {
+        let c = config
+        return FlintConfigView(
+            hidden: c.hiddenSize, qHeads: c.numAttentionHeads, kvHeads: c.numKeyValueHeads, headDim: c.headDim,
+            qDim: c.numAttentionHeads * c.headDim, kvDim: c.numKeyValueHeads * c.headDim,
+            denseFFN: c.intermediateSize, sharedFFN: c.sharedExpertIntermediateSize,
+            expertFFN: c.moeIntermediateSize, experts: c.numExperts, topK: c.numExpertsPerTok,
+            window: c.slidingWindow, ringCap: ringCap, theta: Float(c.ropeTheta), eps: Float(c.rmsNormEps))
+    }
+
+    /// Processes a prompt starting at `startPosition` and returns the greedy next token.
+    /// Uses chunked prefill when enabled, otherwise one decode step per token.
+    package func prefill(_ ids: [Int], startPosition: Int = 0) throws -> Int {
+        precondition(!ids.isEmpty && startPosition + ids.count <= options.maxContext, "prompt exceeds context")
+        guard let engine = prefillEngine else {
+            var next = 0
+            for (i, t) in ids.enumerated() {
+                if let n = try step(token: t, position: startPosition + i, wantLogits: i == ids.count - 1) { next = n }
+            }
+            return next
+        }
+        var pos = startPosition
+        for chunkStart in stride(from: 0, to: ids.count, by: options.prefillChunk) {
+            let chunk = Array(ids[chunkStart..<min(chunkStart + options.prefillChunk, ids.count)])
+            try engine.run(ids: chunk, start: pos, layers: layers, embed: embed, c: configView)
+            pos += chunk.count
+            if chunkStart + chunk.count == ids.count {
+                // Output norm + head on the final row only.
+                let (cb, enc) = try commandBuffer()
+                enc.setComputePipelineState(pNorm)
+                enc.setBuffer(engine.hidden, offset: (chunk.count - 1) * config.hiddenSize * 4, index: 0)
+                set(enc, finalNorm, 1)
+                enc.setBuffer(xn, offset: 0, index: 2)
+                setU32(enc, config.hiddenSize, 3)
+                var eps = Float(config.rmsNormEps)
+                enc.setBytes(&eps, length: 4, index: 4)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: 1024, height: 1, depth: 1))
+                gemv(enc, lmHead, x: xn, y: logits)
+                enc.endEncoding()
+                cb.commit()
+                cb.waitUntilCompleted()
+                if let error = cb.error { throw FlintRuntimeError.metal("\(error)") }
+            }
+        }
+        return argmax()
     }
 
     deinit {
@@ -174,6 +232,8 @@ package final class FlintRunner {
     }
 
     package var residentBytes: Int { store.mappedBytes }
+
+    private var ringCap: Int { config.slidingWindow + options.prefillChunk }
 
     package var expertCacheBytes: Int { layers.compactMap(\.experts).reduce(0) { $0 + $1.pool.length } }
 
@@ -268,7 +328,7 @@ package final class FlintRunner {
         gemv(enc, L.k, x: xn, y: kp)
         gemv(enc, L.v, x: xn, y: vp)
 
-        let slot = L.sliding ? position % c.slidingWindow : position
+        let slot = L.sliding ? position % ringCap : position
         var params = QKParams(numQHeads: UInt32(c.numAttentionHeads), numKVHeads: UInt32(c.numKeyValueHeads),
                               headDim: UInt32(c.headDim), cacheSlot: UInt32(slot), position: UInt32(position),
                               useRope: L.rope ? 1 : 0, theta: Float(c.ropeTheta), eps: Float(c.rmsNormEps))

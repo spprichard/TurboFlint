@@ -140,15 +140,16 @@ package final class FlintExpertCache: @unchecked Sendable {
 
     /// Pending result of `request`: the slot of each expert, plus the loads to wait for.
     package struct Ticket {
-        fileprivate let slots: [Int]
+        package let slots: [Int]
         fileprivate let loads: [FlintLoad]
     }
 
     /// Starts loading any of `experts` that are not resident and returns without waiting.
-    package func request(_ experts: [Int]) -> Ticket {
+    /// Slots in `avoiding` (still read by in-flight GPU work) are never evicted.
+    package func request(_ experts: [Int], avoiding: Set<Int> = []) -> Ticket {
         clock += 1
         var slots = [Int](repeating: -1, count: experts.count)
-        var pinned = Set<Int>()
+        var pinned = avoiding
         var waits: [FlintLoad] = []
         for (i, e) in experts.enumerated() {
             expertUses[e] &+= 1
