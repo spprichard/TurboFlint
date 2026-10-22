@@ -63,6 +63,12 @@ Python."
 At 48 slots, 54% of experts were already cached, 33% were prefetched, and 13% were read on demand.
 The engine read 287 MB from SSD per token.
 
+Results vary with machine load. A later 128-token decode at 32 slots measured 5.61 tok/s while
+another project's Swift build was running and 11.9 GB of swap was in use. That run used 3.4 s of
+user CPU and 22.4 s of kernel CPU over 30.8 s of wall time, so the engine averages under one core.
+The kernel time has not been profiled yet. The likely source is `pread` copying expert data out of
+the page cache, plus swap-ins under memory pressure.
+
 ## Where the time goes, and next steps
 
 - **SSD-bound.** Decode reads about 2.3–2.5 GB/s against a measured ceiling of about 3.3 GB/s.
