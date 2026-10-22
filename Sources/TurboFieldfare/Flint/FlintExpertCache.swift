@@ -12,15 +12,50 @@ package struct FlintExpertSlotLayout {
 }
 
 package struct FlintExpertCacheStats {
+    /// Requested experts already resident.
     package var hits = 0
+    /// Requested experts that a prefetch had loaded or started loading.
+    package var prefetchHits = 0
+    /// Requested experts that had to be read on demand.
     package var misses = 0
+    /// Prefetched experts evicted before any token used them.
+    package var prefetchWasted = 0
     package var bytesRead = 0
-    package var readSeconds = 0.0
+    /// Time the decode thread spent blocked on expert reads.
+    package var waitSeconds = 0.0
+
+    package static func + (a: Self, b: Self) -> Self {
+        Self(hits: a.hits + b.hits, prefetchHits: a.prefetchHits + b.prefetchHits, misses: a.misses + b.misses,
+             prefetchWasted: a.prefetchWasted + b.prefetchWasted, bytesRead: a.bytesRead + b.bytesRead,
+             waitSeconds: a.waitSeconds + b.waitSeconds)
+    }
+}
+
+/// Bounded pool for blocking expert reads. `pread` blocks its thread, so the reads run on an
+/// OperationQueue rather than the Swift Concurrency cooperative pool, which they would starve.
+package final class FlintIOQueue: @unchecked Sendable {
+    let queue: OperationQueue
+
+    package init(concurrency: Int) {
+        queue = OperationQueue()
+        queue.name = "turboflint.expert-io"
+        queue.maxConcurrentOperationCount = max(1, concurrency)
+        queue.qualityOfService = .userInitiated
+    }
+}
+
+/// One in-flight expert load. The loader threads write `error` before leaving `group`; the decode
+/// thread reads it only after `group.wait()`, which orders the accesses.
+private final class FlintLoad: @unchecked Sendable {
+    let group = DispatchGroup()
+    var error: Int32 = 0
 }
 
 /// Per-layer routed-expert cache. Slots live in one page-aligned, no-copy Metal buffer; a miss fills
-/// its slot with nine `pread`s straight from the expert tensors in Ollama's blobs.
+/// its slot with nine `pread`s straight from the expert tensors in Ollama's blobs. Loads are
+/// asynchronous, so the next layer's predicted experts can stream in while this layer computes.
 /// Eviction is least-frequently-used per expert, least-recently-used on ties.
+/// All bookkeeping runs on the decode thread; only slot bytes are written by I/O threads.
 package final class FlintExpertCache: @unchecked Sendable {
     private struct Segment {
         let fd: Int32
@@ -36,17 +71,22 @@ package final class FlintExpertCache: @unchecked Sendable {
     package let pool: MTLBuffer
     private let poolBase: UnsafeMutableRawPointer
     private let segments: [Segment]
+    private let expertBytes: Int
+    private let io: FlintIOQueue
     private var slotExpert: [Int]
     private var slotLastUse: [UInt64]
+    private var slotLoad: [FlintLoad?]
+    private var slotPrefetched: [Bool]
     private var expertSlot: [Int: Int] = [:]
     private var expertUses: [UInt32]
     private var clock: UInt64 = 0
     package private(set) var stats = FlintExpertCacheStats()
 
     package init(layer: Int, checkpoint: FlintOllamaCheckpoint, device: MTLDevice, slotCount: Int,
-                 fds: inout [URL: Int32]) throws {
+                 io: FlintIOQueue, fds: inout [URL: Int32]) throws {
         self.layer = layer
         self.slotCount = slotCount
+        self.io = io
         let prefix = "model.layers.\(layer).mlp.experts."
         var segs: [Segment] = []
         var layout = FlintExpertSlotLayout()
@@ -75,6 +115,7 @@ package final class FlintExpertCache: @unchecked Sendable {
         layout.slotBytes = (cursor + page - 1) / page * page
         self.layout = layout
         self.segments = segs
+        self.expertBytes = segs.reduce(0) { $0 + $1.size }
 
         let total = layout.slotBytes * slotCount
         var raw: UnsafeMutableRawPointer?
@@ -92,81 +133,141 @@ package final class FlintExpertCache: @unchecked Sendable {
         self.poolBase = raw
         self.slotExpert = Array(repeating: -1, count: slotCount)
         self.slotLastUse = Array(repeating: 0, count: slotCount)
+        self.slotLoad = Array(repeating: nil, count: slotCount)
+        self.slotPrefetched = Array(repeating: false, count: slotCount)
         self.expertUses = Array(repeating: 0, count: experts)
     }
 
-    /// Returns the slot byte offset of each requested expert, loading misses from disk first.
-    package func acquire(_ experts: [Int], readConcurrency: Int) throws -> [UInt32] {
+    /// Pending result of `request`: the slot of each expert, plus the loads to wait for.
+    package struct Ticket {
+        fileprivate let slots: [Int]
+        fileprivate let loads: [FlintLoad]
+    }
+
+    /// Starts loading any of `experts` that are not resident and returns without waiting.
+    package func request(_ experts: [Int]) -> Ticket {
         clock += 1
         var slots = [Int](repeating: -1, count: experts.count)
         var pinned = Set<Int>()
+        var waits: [FlintLoad] = []
         for (i, e) in experts.enumerated() {
             expertUses[e] &+= 1
-            if let s = expertSlot[e] {
-                slots[i] = s
-                pinned.insert(s)
-                slotLastUse[s] = clock
+            guard let s = expertSlot[e] else { continue }
+            slots[i] = s
+            pinned.insert(s)
+            slotLastUse[s] = clock
+            if slotPrefetched[s] {
+                slotPrefetched[s] = false
+                stats.prefetchHits += 1
+            } else {
                 stats.hits += 1
             }
+            if let load = slotLoad[s] { waits.append(load) }
         }
-        var loads: [(slot: Int, expert: Int)] = []
         for (i, e) in experts.enumerated() where slots[i] < 0 {
-            let victim = chooseVictim(excluding: pinned)
-            if slotExpert[victim] >= 0 { expertSlot[slotExpert[victim]] = nil }
-            slotExpert[victim] = e
-            expertSlot[e] = victim
-            slotLastUse[victim] = clock
-            pinned.insert(victim)
-            slots[i] = victim
-            loads.append((victim, e))
+            let s = assign(e, excluding: &pinned, priority: .high)
+            slots[i] = s
+            waits.append(slotLoad[s]!)
             stats.misses += 1
         }
-        if !loads.isEmpty { try load(loads, concurrency: readConcurrency) }
-        return slots.map { UInt32($0 * layout.slotBytes) }
+        return Ticket(slots: slots, loads: waits)
+    }
+
+    /// Blocks until every load in `ticket` finished; returns slot byte offsets for the kernels.
+    package func wait(_ ticket: Ticket) throws -> [UInt32] {
+        let start = DispatchTime.now().uptimeNanoseconds
+        for load in ticket.loads { load.group.wait() }
+        stats.waitSeconds += Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
+        for s in ticket.slots {
+            guard let load = slotLoad[s] else { continue }
+            slotLoad[s] = nil
+            if load.error != 0 {
+                expertSlot[slotExpert[s]] = nil
+                slotExpert[s] = -1
+                throw FlintRuntimeError.posix("pread expert (layer \(layer))", load.error)
+            }
+        }
+        return ticket.slots.map { UInt32($0 * layout.slotBytes) }
+    }
+
+    /// Starts background loads for experts this layer is likely to need next. Never blocks, and never
+    /// evicts a slot that is still loading.
+    package func prefetch(_ experts: [Int]) {
+        var pinned = Set<Int>()
+        for e in experts {
+            if let s = expertSlot[e] { pinned.insert(s) }
+        }
+        for e in experts where expertSlot[e] == nil {
+            guard hasEvictableSlot(excluding: pinned) else { return }
+            let s = assign(e, excluding: &pinned, priority: .normal)
+            slotPrefetched[s] = true
+        }
+    }
+
+    private func hasEvictableSlot(excluding pinned: Set<Int>) -> Bool {
+        (0..<slotCount).contains { !pinned.contains($0) && isSettled($0) }
+    }
+
+    /// True when slot `s` has no load in flight. Finished loads that nobody waited on (mispredicted
+    /// prefetches) are retired here; a failed one drops its expert mapping so it is read again.
+    private func isSettled(_ s: Int) -> Bool {
+        guard let load = slotLoad[s] else { return true }
+        guard load.group.wait(timeout: .now()) == .success else { return false }
+        slotLoad[s] = nil
+        if load.error != 0, slotExpert[s] >= 0 {
+            expertSlot[slotExpert[s]] = nil
+            slotExpert[s] = -1
+            slotPrefetched[s] = false
+        }
+        return true
+    }
+
+    /// Picks a victim slot for `expert`, records the mapping, and queues its nine reads.
+    private func assign(_ expert: Int, excluding pinned: inout Set<Int>,
+                        priority: Operation.QueuePriority) -> Int {
+        let victim = chooseVictim(excluding: pinned)
+        if slotExpert[victim] >= 0 {
+            expertSlot[slotExpert[victim]] = nil
+            if slotPrefetched[victim] { stats.prefetchWasted += 1 }
+        }
+        slotExpert[victim] = expert
+        expertSlot[expert] = victim
+        slotLastUse[victim] = clock
+        slotPrefetched[victim] = false
+        pinned.insert(victim)
+
+        let load = FlintLoad()
+        slotLoad[victim] = load
+        nonisolated(unsafe) let dstBase = poolBase.advanced(by: victim * layout.slotBytes)
+        for seg in segments {
+            load.group.enter()
+            let op = BlockOperation {
+                let dst = dstBase.advanced(by: seg.dst)
+                let off = off_t(seg.base + seg.stride * UInt64(expert))
+                var done = 0
+                while done < seg.size {
+                    let n = pread(seg.fd, dst.advanced(by: done), seg.size - done, off + off_t(done))
+                    if n <= 0 { load.error = n == 0 ? EIO : errno; break }
+                    done += n
+                }
+                load.group.leave()
+            }
+            op.queuePriority = priority
+            io.queue.addOperation(op)
+        }
+        stats.bytesRead += expertBytes
+        return victim
     }
 
     private func chooseVictim(excluding pinned: Set<Int>) -> Int {
         var best = -1
-        for s in 0..<slotCount where !pinned.contains(s) {
+        for s in 0..<slotCount where !pinned.contains(s) && isSettled(s) {
             if slotExpert[s] < 0 { return s }
             if best < 0 { best = s; continue }
             let u = expertUses[slotExpert[s]], bu = expertUses[slotExpert[best]]
             if u < bu || (u == bu && slotLastUse[s] < slotLastUse[best]) { best = s }
         }
-        precondition(best >= 0, "expert cache needs more slots than experts per token")
+        precondition(best >= 0, "expert cache needs more free slots than experts per token")
         return best
-    }
-
-    private func load(_ loads: [(slot: Int, expert: Int)], concurrency: Int) throws {
-        let start = DispatchTime.now().uptimeNanoseconds
-        let jobs = loads.flatMap { l in segments.map { (l.slot, l.expert, $0) } }
-        let failures = UnsafeMutablePointer<Int32>.allocate(capacity: jobs.count)
-        failures.initialize(repeating: 0, count: jobs.count)
-        defer { failures.deallocate() }
-        nonisolated(unsafe) let base = poolBase
-        nonisolated(unsafe) let fail = failures
-        let slotBytes = layout.slotBytes
-        let lanes = max(1, min(concurrency, jobs.count))
-        DispatchQueue.concurrentPerform(iterations: lanes) { lane in
-            var j = lane
-            while j < jobs.count {
-                let (slot, expert, seg) = jobs[j]
-                let dst = base.advanced(by: slot * slotBytes + seg.dst)
-                var done = 0
-                let off = off_t(seg.base + seg.stride * UInt64(expert))
-                while done < seg.size {
-                    let n = pread(seg.fd, dst.advanced(by: done), seg.size - done, off + off_t(done))
-                    if n <= 0 { fail[j] = n == 0 ? EIO : errno; break }
-                    done += n
-                }
-                j += lanes
-            }
-        }
-        if let bad = (0..<jobs.count).first(where: { failures[$0] != 0 }) {
-            for l in loads { expertSlot[l.expert] = nil; slotExpert[l.slot] = -1 }
-            throw FlintRuntimeError.posix("pread expert (layer \(layer))", failures[bad])
-        }
-        stats.bytesRead += loads.count * segments.reduce(0) { $0 + $1.size }
-        stats.readSeconds += Double(DispatchTime.now().uptimeNanoseconds - start) / 1e9
     }
 }

@@ -33,11 +33,20 @@ struct TurboFlintCLI: AsyncParsableCommand {
     @Option(help: "Parallel pread lanes for expert loads.")
     var readConcurrency = 8
 
+    @Flag(help: "Disable next-layer expert prefetch.")
+    var noPrefetch = false
+
+    @Flag(help: "Read experts with F_NOCACHE (no OS page-cache copy).")
+    var noPageCache = false
+
     @Flag(help: "Print generated ids as JSON on the last line (for oracle comparison).")
     var json = false
 
     @Option(help: "Write per-layer residual stream of the last prompt token to this JSON file (debug).")
     var dumpHidden: String?
+
+    @Flag(help: "Measure next-layer expert prediction accuracy (debug).")
+    var measurePrediction = false
 
     @Flag(help: "Time individual kernels and exit.")
     var profileKernels = false
@@ -61,6 +70,8 @@ struct TurboFlintCLI: AsyncParsableCommand {
         options.maxContext = maxContext
         options.slotsPerLayer = slots
         options.readConcurrency = readConcurrency
+        options.bypassPageCache = noPageCache
+        options.prefetchNextLayer = !noPrefetch
         let loadStart = Date()
         let context = try MetalContext()
         let runner = try FlintRunner(checkpoint: checkpoint, context: context, options: options)
@@ -71,6 +82,7 @@ struct TurboFlintCLI: AsyncParsableCommand {
             for (name, ms) in try runner.profileKernels() { log(String(format: "%-28@ %8.3f ms", name as NSString, ms)) }
             return
         }
+        runner.measurePrediction = measurePrediction
         log("prompt: \(ids.count) tokens")
 
         let eos = Set(checkpoint.config.eosTokenID)
@@ -120,9 +132,18 @@ struct TurboFlintCLI: AsyncParsableCommand {
         log(String(format: "gpu busy ms/tok: attention+router %.1f, shared %.1f, routed %.1f, head %.1f",
                    gA / Double(steps) * 1000, gS / Double(steps) * 1000, gR / Double(steps) * 1000,
                    gH / Double(steps) * 1000))
-        log(String(format: "decode expert cache: hit rate %.1f%%, %.0f MB read/tok",
-                   100 * Double(hits) / Double(max(1, hits + misses)),
-                   Double(s.bytesRead - afterPrefill.bytesRead) / Double(steps) / 1e6))
+        let pre = s.prefetchHits - afterPrefill.prefetchHits
+        let total = max(1, hits + misses + pre)
+        log(String(format: "decode experts: %.1f%% cached, %.1f%% prefetched, %.1f%% read on demand; %.0f MB read/tok, %.1f ms/tok blocked; %d prefetches wasted",
+                   100 * Double(hits) / Double(total), 100 * Double(pre) / Double(total),
+                   100 * Double(misses) / Double(total),
+                   Double(s.bytesRead - afterPrefill.bytesRead) / Double(steps) / 1e6,
+                   (s.waitSeconds - afterPrefill.waitSeconds) / Double(steps) * 1000,
+                   s.prefetchWasted - afterPrefill.prefetchWasted))
+        if measurePrediction {
+            log(String(format: "next-layer prediction: %.1f%% of experts guessed",
+                       100 * Double(runner.predictionOverlap) / Double(max(1, runner.predictionTotal))))
+        }
         log(String(format: "peak footprint %.2f GB", Double(peakFootprint()) / 1e9))
         if json {
             let out: [String: Any] = ["prompt_ids": ids, "generated_ids": generated]

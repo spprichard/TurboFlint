@@ -7,6 +7,10 @@ package struct FlintRunnerOptions: Sendable {
     /// Routed-expert cache slots per MoE layer (each slot holds one 1.77 MB expert).
     package var slotsPerLayer = 32
     package var readConcurrency = 8
+    /// Read routed experts with F_NOCACHE so the OS page cache does not hold a second copy.
+    package var bypassPageCache = false
+    /// Run each layer's successor router on its input and start loading the predicted experts.
+    package var prefetchNextLayer = true
     package init() {}
 }
 
@@ -56,10 +60,16 @@ package final class FlintRunner {
 
     // Scratch
     private let h, xn, qp, kp, vp, qr, attn, tmp, mid, sharedOut, moeMid, routed, logits: MTLBuffer
-    private let routerScores, routerIDs, routerWeights, slotBase, attnM, attnD, attnO: MTLBuffer
+    private let routerScores, routerIDs, routerWeights, slotBase, predIDs, predWeights, attnM, attnD, attnO: MTLBuffer
     private static let maxChunks = 32
 
     package private(set) var lastTiming = FlintStepTiming()
+    /// When true, each MoE layer also runs the next layer's router on its own post-attention input
+    /// and records how many of that layer's real top-k experts the guess contained.
+    package var measurePrediction = false
+    package private(set) var predictionOverlap = 0
+    package private(set) var predictionTotal = 0
+    private var lastPrediction: [Int] = []
     /// When set, `step` copies the residual stream after every layer here (FP32, layers x hidden).
     package var debugHidden: MTLBuffer?
 
@@ -96,6 +106,7 @@ package final class FlintRunner {
         let c = checkpoint.config
         let kvRow = c.numKeyValueHeads * c.headDim * MemoryLayout<UInt16>.size
         var fds: [URL: Int32] = [:]
+        let io = FlintIOQueue(concurrency: options.readConcurrency)
         for i in 0..<c.numHiddenLayers {
             let p = "model.layers.\(i)."
             let a = p + "self_attn."
@@ -117,10 +128,13 @@ package final class FlintRunner {
                 down: try store.matrix(mlp + "down_proj.weight"),
                 router: dense ? nil : try store.ref(p + "mlp.gate.weight"),
                 experts: dense ? nil : try FlintExpertCache(layer: i, checkpoint: checkpoint, device: device,
-                                                             slotCount: options.slotsPerLayer, fds: &fds),
+                                                             slotCount: options.slotsPerLayer, io: io, fds: &fds),
                 kCache: kc, vCache: vc))
         }
         expertFDs = fds
+        if options.bypassPageCache {
+            for fd in fds.values { _ = fcntl(fd, F_NOCACHE, 1) }
+        }
 
         func buf(_ bytes: Int, shared: Bool = false) throws -> MTLBuffer {
             guard let b = device.makeBuffer(length: max(bytes, 16),
@@ -144,6 +158,8 @@ package final class FlintRunner {
         routed = try buf(H * f32)
         logits = try buf(c.vocabSize * f32, shared: true)
         routerScores = try buf(c.numExperts * 4)
+        predIDs = try buf(16 * 4, shared: true)
+        predWeights = try buf(16 * 4)
         routerIDs = try buf(16 * 4, shared: true)
         routerWeights = try buf(16 * 4)
         slotBase = try buf(16 * 4, shared: true)
@@ -162,12 +178,7 @@ package final class FlintRunner {
     package var expertCacheBytes: Int { layers.compactMap(\.experts).reduce(0) { $0 + $1.pool.length } }
 
     package var expertStats: FlintExpertCacheStats {
-        layers.compactMap(\.experts).reduce(into: FlintExpertCacheStats()) { acc, e in
-            acc.hits += e.stats.hits
-            acc.misses += e.stats.misses
-            acc.bytesRead += e.stats.bytesRead
-            acc.readSeconds += e.stats.readSeconds
-        }
+        layers.compactMap(\.experts).reduce(FlintExpertCacheStats()) { $0 + $1.stats }
     }
 
     // MARK: - Encoding helpers
@@ -225,7 +236,8 @@ package final class FlintRunner {
                             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
     }
 
-    private func encodeRouter(_ enc: MTLComputeCommandEncoder, _ router: FlintBufferRef) {
+    private func encodeRouter(_ enc: MTLComputeCommandEncoder, _ router: FlintBufferRef,
+                              ids: MTLBuffer? = nil, weights: MTLBuffer? = nil) {
         let c = config
         enc.setComputePipelineState(pRouterScores)
         enc.setBuffer(xn, offset: 0, index: 0)
@@ -236,8 +248,8 @@ package final class FlintRunner {
                                  threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         enc.setComputePipelineState(pRouterSelect)
         enc.setBuffer(routerScores, offset: 0, index: 0)
-        enc.setBuffer(routerIDs, offset: 0, index: 1)
-        enc.setBuffer(routerWeights, offset: 0, index: 2)
+        enc.setBuffer(ids ?? routerIDs, offset: 0, index: 1)
+        enc.setBuffer(weights ?? routerWeights, offset: 0, index: 2)
         setU32(enc, c.numExperts, 3); setU32(enc, c.numExpertsPerTok, 4)
         enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
@@ -372,6 +384,10 @@ package final class FlintRunner {
                 continue
             }
             encodeRouter(enc, router)
+            let nextRouter = layerIndex + 1 < layers.count ? layers[layerIndex + 1].router : nil
+            if measurePrediction || options.prefetchNextLayer, let nextRouter {
+                encodeRouter(enc, nextRouter, ids: predIDs, weights: predWeights)
+            }
             enc.endEncoding()
             try finish(cb, wait: true, timing: &timing, kind: 0)
 
@@ -384,8 +400,21 @@ package final class FlintRunner {
 
             let idPtr = routerIDs.contents().assumingMemoryBound(to: UInt32.self)
             let ids = (0..<k).map { Int(idPtr[$0]) }
+            if measurePrediction {
+                if !lastPrediction.isEmpty {
+                    predictionOverlap += Set(lastPrediction).intersection(ids).count
+                    predictionTotal += k
+                }
+                let pp = predIDs.contents().assumingMemoryBound(to: UInt32.self)
+                lastPrediction = nextRouter == nil ? [] : (0..<k).map { Int(pp[$0]) }
+            }
             let ioStart = DispatchTime.now().uptimeNanoseconds
-            let offsets = try experts.acquire(ids, readConcurrency: options.readConcurrency)
+            let ticket = experts.request(ids)
+            if options.prefetchNextLayer, nextRouter != nil, let next = layers[layerIndex + 1].experts {
+                let pp = predIDs.contents().assumingMemoryBound(to: UInt32.self)
+                next.prefetch((0..<k).map { Int(pp[$0]) })
+            }
+            let offsets = try experts.wait(ticket)
             timing.ioSeconds += Double(DispatchTime.now().uptimeNanoseconds - ioStart) / 1e9
             let sb = slotBase.contents().assumingMemoryBound(to: UInt32.self)
             for (i, o) in offsets.enumerated() { sb[i] = o }
@@ -484,6 +513,20 @@ extension FlintRunner {
         out.append(try time("router+top6") { self.encodeRouter($0, L.router!) })
         out.append(try time("shared gate_up 1024x2048") { self.gateUp($0, L.gate, L.up, x: self.xn, out: self.mid) })
         out.append(try time("lm_head 150144x2048") { self.gemv($0, self.lmHead, x: self.xn, y: self.logits) })
+        // Same kernel, one dispatch per command buffer, after an idle gap (GPU clock ramp test).
+        for gapMs in [0, 5, 20, 50] {
+            var total = 0.0
+            for _ in 0..<10 {
+                if gapMs > 0 { usleep(useconds_t(gapMs * 1000)) }
+                let (cb, enc) = try commandBuffer()
+                gemv(enc, lmHead, x: xn, y: logits)
+                enc.endEncoding()
+                cb.commit()
+                cb.waitUntilCompleted()
+                total += cb.gpuEndTime - cb.gpuStartTime
+            }
+            out.append(("lm_head after \(gapMs) ms idle", total / 10 * 1000))
+        }
         return out
     }
 }
