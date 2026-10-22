@@ -1,3 +1,24 @@
+# TurboFlint
+
+TurboFlint runs Recursive Flint, a 40B-total, 2.5B-active MoE model, on a 16 GB Apple Silicon Mac.
+The 1.3 GB shared core stays memory-mapped. The 21.3 GB of routed experts stream from SSD into a
+per-layer cache, with next-layer prefetch.
+
+It is a fork of [drumih/turbo-fieldfare](https://github.com/drumih/turbo-fieldfare), which does the
+same for Gemma 4 26B-A4B. The Flint runtime lives in `Sources/TurboFieldfare/Flint/`. The rest of
+this README is upstream's documentation of the Gemma engine, which is still in the tree.
+
+- **Design, correctness checks, and M2 Air measurements:** [docs/FLINT.md](docs/FLINT.md).
+- **Weights:** read in place from a local `ollama pull flint:40b-a2b-qat-int4`.
+
+```bash
+swift build -c release --product turboflint --product turboflint-server
+.build/release/turboflint --chat "Explain a hash map." --max-new 256
+.build/release/turboflint-server --port 8080   # OpenAI-compatible, 127.0.0.1 only
+```
+
+---
+
 <p align="center">
   <img src="docs/assets/turbofieldfare-logo-rounded.png" alt="TurboFieldfare logo: a fieldfare inside a segmented cache ring" width="280">
 </p>
